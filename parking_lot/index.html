@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="generator" content="rustdoc">
+    <meta name="description" content="API documentation for the Rust `parking_lot` crate.">
+    <meta name="keywords" content="rust, rustlang, rust-lang, parking_lot">
+
+    <title>parking_lot - Rust</title>
+
+    <link rel="stylesheet" type="text/css" href="../rustdoc.css">
+    <link rel="stylesheet" type="text/css" href="../main.css">
+    
+
+    
+    
+</head>
+<body class="rustdoc">
+    <!--[if lte IE 8]>
+    <div class="warning">
+        This old browser is unsupported and will most likely display funky
+        things.
+    </div>
+    <![endif]-->
+
+    
+
+    <nav class="sidebar">
+        
+        <p class='location'></p><script>window.sidebarCurrent = {name: 'parking_lot', ty: 'mod', relpath: '../'};</script>
+    </nav>
+
+    <nav class="sub">
+        <form class="search-form js-only">
+            <div class="search-container">
+                <input class="search-input" name="search"
+                       autocomplete="off"
+                       placeholder="Click or press ‘S’ to search, ‘?’ for more options…"
+                       type="search">
+            </div>
+        </form>
+    </nav>
+
+    <section id='main' class="content mod">
+<h1 class='fqn'><span class='in-band'>Crate <a class='mod' href=''>parking_lot</a></span><span class='out-of-band'><span id='render-detail'>
+                   <a id="toggle-all-docs" href="javascript:void(0)" title="collapse all docs">
+                       [<span class='inner'>&#x2212;</span>]
+                   </a>
+               </span><a id='src-0' class='srclink' href='../src/parking_lot/src/lib.rs.html#8-120' title='goto source code'>[src]</a></span></h1>
+<div class='docblock'><p>This library provides implementations of <code>Mutex</code>, <code>RwLock</code>, <code>Condvar</code> and
+<code>Once</code> that are smaller, faster and more flexible than those in the Rust
+standard library. It also exposes a low-level API for creating your own
+efficient synchronization primitives.</p>
+
+<h1 id='features' class='section-header'><a href='#features'>Features</a></h1>
+<p>The primitives provided by this library have several advantages over those
+in the Rust standard library:</p>
+
+<ol>
+<li><code>Mutex</code>, <code>Condvar</code> and <code>Once</code> only require 1 byte of storage space, and
+<code>RwLock</code> only requires 1 word of storage space. On the other hand the
+standard library primitives require a dynamically allocated <code>Box</code> to hold
+OS-specific synchronization primitives. The small size of <code>Mutex</code> in
+particular encourages the use of fine-grained locks to increase
+parallelism.</li>
+<li>Since they consist of just a single atomic variable, have constant
+initializers and don&#39;t need destructors, these primitives can be used as
+<code>static</code> global variables. The standard library primitives require
+dynamic initialization and thus need to be lazily initialized with
+<code>lazy_static!</code>.</li>
+<li>Uncontended lock acquisition and release is done through fast inline
+paths which only require a single atomic operation.</li>
+<li>Microcontention (a contended lock with a short critical section) is
+efficiently handled by spinning a few times while trying to acquire a
+lock.</li>
+<li>The locks are adaptive and will suspend a thread after a few failed spin
+attempts. This makes the locks suitable for both long and short critical
+sections.</li>
+</ol>
+
+<h1 id='the-parking-lot' class='section-header'><a href='#the-parking-lot'>The parking lot</a></h1>
+<p>To keep these primitives small, all thread queuing and suspending
+functionality is offloaded to the <em>parking lot</em>. The idea behind this is
+based on the Webkit <a href="https://webkit.org/blog/6161/locking-in-webkit/"><code>WTF::ParkingLot</code></a> class, which essentially
+consists of a hash table mapping of lock addresses to queues of parked
+(sleeping) threads. The Webkit parking lot was itself inspired by Linux
+<a href="http://man7.org/linux/man-pages/man2/futex.2.html">futexes</a>, but it is more
+powerful since it allows invoking callbacks while holding a queue lock.</p>
+
+<p><em>Parking</em> refers to suspending the thread while simultaneously enqueuing it
+on a queue keyed by some address. <em>Unparking</em> refers to dequeuing a thread
+from a queue keyed by some address and resuming it. The parking lot API
+consists of just 3 functions:</p>
+
+<pre class='rust rust-example-rendered'>
+<span class='kw'>unsafe</span> <span class='kw'>fn</span> <span class='ident'>park</span>(<span class='ident'>key</span>: <span class='ident'>usize</span>,
+               <span class='ident'>validate</span>: <span class='kw-2'>&amp;</span><span class='kw-2'>mut</span> <span class='ident'>FnMut</span>() <span class='op'>-&gt;</span> <span class='ident'>bool</span>,
+               <span class='ident'>before_sleep</span>: <span class='kw-2'>&amp;</span><span class='kw-2'>mut</span> <span class='ident'>FnMut</span>(),
+               <span class='ident'>timeout</span>: <span class='prelude-ty'>Option</span><span class='op'>&lt;</span><span class='ident'>Instant</span><span class='op'>&gt;</span>)
+               <span class='op'>-&gt;</span> <span class='ident'>bool</span></pre>
+
+<p>This function performs the following steps:</p>
+
+<ol>
+<li>Lock the queue associated with <code>key</code>.</li>
+<li>Call <code>validate</code>, if it returns <code>false</code>, unlock the queue and return.</li>
+<li>Add the current thread to the queue.</li>
+<li>Unlock the queue.</li>
+<li>Call <code>before_sleep</code>.</li>
+<li>Sleep until we are unparked or <code>timeout</code> is reached.</li>
+<li>Return <code>true</code> if we were unparked by another thread, <code>false</code> otherwise.</li>
+</ol>
+
+<pre class='rust rust-example-rendered'>
+<span class='kw'>unsafe</span> <span class='kw'>fn</span> <span class='ident'>unpark_one</span>(<span class='ident'>key</span>: <span class='ident'>usize</span>,
+                     <span class='ident'>callback</span>: <span class='kw-2'>&amp;</span><span class='kw-2'>mut</span> <span class='ident'>FnMut</span>(<span class='ident'>UnparkResult</span>))
+                     <span class='op'>-&gt;</span> <span class='ident'>UnparkResult</span></pre>
+
+<p>This function will unpark a single thread from the queue associated with
+<code>key</code>. The <code>callback</code> function is invoked while holding the queue lock but
+before the thread is unparked. The <code>UnparkResult</code> indicates whether the
+queue was empty and, if not, whether there are still threads remaining in
+the queue.</p>
+
+<pre class='rust rust-example-rendered'>
+<span class='kw'>unsafe</span> <span class='kw'>fn</span> <span class='ident'>unpark_all</span>(<span class='ident'>key</span>: <span class='ident'>usize</span>) <span class='op'>-&gt;</span> <span class='ident'>usize</span></pre>
+
+<p>This function will unpark all threads in the queue associated with <code>key</code>. It
+returns the number of threads that were unparked.</p>
+
+<h1 id='building-custom-synchronization-primitives' class='section-header'><a href='#building-custom-synchronization-primitives'>Building custom synchronization primitives</a></h1>
+<p>Building custom synchronization primitives is very simple since
+<code>parking_lot</code> takes care of all the hard parts for you. The most commmon
+case for a custom primitive would be to integrate a <code>Mutex</code> inside another
+data type. Since a mutex only requires 2 bits, it can share space with other
+data. For example, one could create an <code>ArcMutex</code> type that combines the
+atomic reference count and the two mutex bits in the same atomic word.</p>
+</div><h2 id='structs' class='section-header'><a href="#structs">Structs</a></h2>
+<table>
+                       <tr class=' module-item'>
+                           <td><a class='struct' href='struct.Condvar.html'
+                                  title='parking_lot::Condvar'>Condvar</a></td>
+                           <td class='docblock short'>
+                                <p>A Condition Variable</p>
+                           </td>
+                       </tr>
+                       <tr class=' module-item'>
+                           <td><a class='struct' href='struct.Mutex.html'
+                                  title='parking_lot::Mutex'>Mutex</a></td>
+                           <td class='docblock short'>
+                                <p>A mutual exclusion primitive useful for protecting shared data</p>
+                           </td>
+                       </tr>
+                       <tr class=' module-item'>
+                           <td><a class='struct' href='struct.MutexGuard.html'
+                                  title='parking_lot::MutexGuard'>MutexGuard</a></td>
+                           <td class='docblock short'>
+                                <p>An RAII implementation of a &quot;scoped lock&quot; of a mutex. When this structure is
+dropped (falls out of scope), the lock will be unlocked.</p>
+                           </td>
+                       </tr>
+                       <tr class=' module-item'>
+                           <td><a class='struct' href='struct.Once.html'
+                                  title='parking_lot::Once'>Once</a></td>
+                           <td class='docblock short'>
+                                <p>A synchronization primitive which can be used to run a one-time
+initialization. Useful for one-time initialization for globals, FFI or
+related functionality.</p>
+                           </td>
+                       </tr>
+                       <tr class=' module-item'>
+                           <td><a class='struct' href='struct.OnceState.html'
+                                  title='parking_lot::OnceState'>OnceState</a></td>
+                           <td class='docblock short'>
+                                <p>State yielded to the <code>call_once_force</code> method which can be used to query
+whether the <code>Once</code> was previously poisoned or not.</p>
+                           </td>
+                       </tr>
+                       <tr class=' module-item'>
+                           <td><a class='struct' href='struct.RwLock.html'
+                                  title='parking_lot::RwLock'>RwLock</a></td>
+                           <td class='docblock short'>
+                                <p>A reader-writer lock</p>
+                           </td>
+                       </tr>
+                       <tr class=' module-item'>
+                           <td><a class='struct' href='struct.RwLockReadGuard.html'
+                                  title='parking_lot::RwLockReadGuard'>RwLockReadGuard</a></td>
+                           <td class='docblock short'>
+                                <p>RAII structure used to release the shared read access of a lock when
+dropped.</p>
+                           </td>
+                       </tr>
+                       <tr class=' module-item'>
+                           <td><a class='struct' href='struct.RwLockWriteGuard.html'
+                                  title='parking_lot::RwLockWriteGuard'>RwLockWriteGuard</a></td>
+                           <td class='docblock short'>
+                                <p>RAII structure used to release the exclusive write access of a lock when
+dropped.</p>
+                           </td>
+                       </tr>
+                       <tr class=' module-item'>
+                           <td><a class='struct' href='struct.WaitTimeoutResult.html'
+                                  title='parking_lot::WaitTimeoutResult'>WaitTimeoutResult</a></td>
+                           <td class='docblock short'>
+                                <p>A type indicating whether a timed wait on a condition variable returned
+due to a time out or not.</p>
+                           </td>
+                       </tr></table><h2 id='enums' class='section-header'><a href="#enums">Enums</a></h2>
+<table>
+                       <tr class=' module-item'>
+                           <td><a class='enum' href='enum.UnparkResult.html'
+                                  title='parking_lot::UnparkResult'>UnparkResult</a></td>
+                           <td class='docblock short'>
+                                <p>Result of an <code>unpark_one</code> operation.</p>
+                           </td>
+                       </tr></table><h2 id='functions' class='section-header'><a href="#functions">Functions</a></h2>
+<table>
+                       <tr class=' module-item'>
+                           <td><a class='fn' href='fn.park.html'
+                                  title='parking_lot::park'>park</a></td>
+                           <td class='docblock short'>
+                                <p>Parks the current thread in the queue associated with the given key.</p>
+                           </td>
+                       </tr>
+                       <tr class=' module-item'>
+                           <td><a class='fn' href='fn.unpark_all.html'
+                                  title='parking_lot::unpark_all'>unpark_all</a></td>
+                           <td class='docblock short'>
+                                <p>Unparks all threads in the queue associated with the given key.</p>
+                           </td>
+                       </tr>
+                       <tr class=' module-item'>
+                           <td><a class='fn' href='fn.unpark_one.html'
+                                  title='parking_lot::unpark_one'>unpark_one</a></td>
+                           <td class='docblock short'>
+                                <p>Unparks one thread from the queue associated with the given key.</p>
+                           </td>
+                       </tr></table></section>
+    <section id='search' class="content hidden"></section>
+
+    <section class="footer"></section>
+
+    <aside id="help" class="hidden">
+        <div>
+            <h1 class="hidden">Help</h1>
+
+            <div class="shortcuts">
+                <h2>Keyboard Shortcuts</h2>
+
+                <dl>
+                    <dt>?</dt>
+                    <dd>Show this help dialog</dd>
+                    <dt>S</dt>
+                    <dd>Focus the search field</dd>
+                    <dt>&larrb;</dt>
+                    <dd>Move up in search results</dd>
+                    <dt>&rarrb;</dt>
+                    <dd>Move down in search results</dd>
+                    <dt>&#9166;</dt>
+                    <dd>Go to active search result</dd>
+                </dl>
+            </div>
+
+            <div class="infos">
+                <h2>Search Tricks</h2>
+
+                <p>
+                    Prefix searches with a type followed by a colon (e.g.
+                    <code>fn:</code>) to restrict the search to a given type.
+                </p>
+
+                <p>
+                    Accepted types are: <code>fn</code>, <code>mod</code>,
+                    <code>struct</code>, <code>enum</code>,
+                    <code>trait</code>, <code>type</code>, <code>macro</code>,
+                    and <code>const</code>.
+                </p>
+
+                <p>
+                    Search functions by type signature (e.g.
+                    <code>vec -> usize</code> or <code>* -> vec</code>)
+                </p>
+            </div>
+        </div>
+    </aside>
+
+    
+
+    <script>
+        window.rootPath = "../";
+        window.currentCrate = "parking_lot";
+        window.playgroundUrl = "";
+    </script>
+    <script src="../jquery.js"></script>
+    <script src="../main.js"></script>
+    
+    <script defer src="../search-index.js"></script>
+</body>
+</html>

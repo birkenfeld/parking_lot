@@ -1,0 +1,1 @@
+initSidebarItems({"struct":[["Mutex","A mutual exclusion primitive useful for protecting shared data"],["MutexGuard","An RAII implementation of a \"scoped lock\" of a mutex. When this structure is dropped (falls out of scope), the lock will be unlocked."]]});
